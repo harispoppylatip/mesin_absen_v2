@@ -1,32 +1,70 @@
 # Kebutuhan layanan wajah InsightFace untuk aplikasi absen solat.
 #
-# Pemasangan di Windows:
+# CARA PASANG, DUA LANGKAH DAN URUTANNYA PENTING
+# ----------------------------------------------
 #     python -m venv .venv
 #     .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+#     .\.venv\Scripts\python.exe tambal_insightface.py      <-- WAJIB
+#
+# Berkas ini SENGAJA TIDAK memuat insightface.
+#
+# `pip install insightface==0.7.3` selalu mengunduh berkas SUMBER, bukan roda
+# siap pakai, lalu mencoba mengompilasi satu ekstensi C++ bernama
+# `mesh_core_cython`. Ekstensi itu hanya dipakai untuk render topeng wajah 3D,
+# sedangkan deteksi dan pengenalan wajah tidak memakainya sama sekali. Karena
+# itu pemasangan gagal di DUA tempat sekaligus:
+#
+#   Windows tanpa Windows 10 SDK
+#       fatal error C1083: Cannot open include file: 'stdio.h'
+#   python:3.10-slim di dalam Docker, yang memang tidak membawa compiler
+#       error: [Errno 2] No such file or directory: 'g++'
+#       ERROR: Failed building wheel for insightface
+#
+# Langkah KEDUA menempuh jalan lain: mematikan ekstensi itu, memasang pengganti
+# murni Python, lalu memasang paketnya dengan `--no-build-isolation --no-deps`.
+# Cara itu terbukti bekerja di Windows dan dipakai juga oleh Dockerfile, jadi
+# tidak ada DUA salinan logika tambalan yang harus diubah bersamaan.
 #
 # Di Linux dan di dalam Docker, berkas yang sama dipakai apa adanya: baris
 # opencv memakai penanda lingkungan, jadi Windows mendapat opencv yang bisa
 # membuka jendela sedangkan Linux mendapat versi tanpa tampilan supaya tidak
 # perlu memasang pustaka grafik di dalam citra.
+
+# --- perkakas bangun --------------------------------------------------
+# Dipakai langkah KEDUA. insightface dipasang dengan --no-build-isolation,
+# artinya pip TIDAK menyiapkan perkakas bangunnya sendiri, sehingga seluruh isi
+# [build-system] pada pyproject.toml insightface (setuptools, numpy, cython)
+# wajib sudah ada di sini.
 #
-# Catatan tentang insightface 0.7.3
-# ---------------------------------
-# Paketnya hanya tersedia sebagai kode sumber. Di Windows, berkas setup.py-nya
-# memaksa kompilasi modul Cython `mesh_core_cython` yang hanya dipakai untuk
-# render wajah 3D, dan kompilasi itu gagal tanpa Visual Studio Build Tools.
-# Skrip `install-insightface.ps1` di folder induk mengurus itu: mengosongkan
-# `ext_modules`, menambahkan pengganti murni Python untuk mesh_core_cython,
-# lalu memasangnya dengan `--no-build-isolation`. Modul itu tidak pernah
-# dipanggil oleh deteksi maupun pengenalan wajah.
+# Perhatikan juga: setup.py insightface mengimpor Cython dan numpy di baris
+# paling atas, jadi keduanya tetap WAJIB ada walau ekstensi C++-nya dimatikan.
 #
-# Di dalam Docker pemasangan berjalan normal tanpa skrip itu, karena dasar
-# citranya sudah memuat perkakas bangun (lihat Dockerfile).
+# Versi setuptools di bawah bukan tebakan, itu versi yang benar benar dipakai
+# saat pemasangan di Windows berhasil.
+setuptools==84.0.0
+wheel==0.48.0
+Cython==3.0.12
+numpy==1.26.4
 
 # --- angka dan gambar -------------------------------------------------
-numpy==1.26.4
 Pillow==12.3.0
 opencv-python-headless==4.11.0.86 ; sys_platform != "win32"
 opencv-python==4.11.0.86 ; sys_platform == "win32"
+
+# matplotlib BUKAN hiasan dan BUKAN pilihan.
+#
+# Rantai impornya begini: `insightface.app` mengimpor `mask_renderer`, yang
+# mengimpor `thirdparty.face3d`, yang mengimpor `mesh`, dan `mesh/__init__.py`
+# menulis `from . import vis`, sedangkan `vis.py` memakai matplotlib. Jadi
+# `import insightface` GAGAL tanpa matplotlib, walau deteksi dan pengenalan
+# wajah sendiri tidak menyentuhnya.
+#
+# Daftar ini diperiksa dengan mengamati modul yang benar benar termuat saat
+# mengimpor insightface.app, bukan hanya dipercaya dari install_requires
+# paketnya. Cara itu penting karena insightface dipasang memakai --no-deps:
+# setiap kebutuhan yang tidak tertulis di berkas ini TIDAK akan ikut terpasang,
+# dan kegagalannya baru muncul sebagai ModuleNotFoundError saat layanan dipakai.
+matplotlib==3.10.9
 
 # --- mesin wajah ------------------------------------------------------
 # CPU saja. Untuk kartu grafis NVIDIA, ganti jadi onnxruntime-gpu dan setel
@@ -34,11 +72,13 @@ opencv-python==4.11.0.86 ; sys_platform == "win32"
 # terukur di mesin ini.
 onnxruntime==1.23.2
 onnx==1.23.2
-insightface==0.7.3
+
+# insightface TIDAK didaftarkan di sini dengan sengaja. Lihat cara pasang di
+# bagian paling atas berkas ini.
 
 # Kebutuhan langsung InsightFace, ditulis terpisah supaya pemasangan di dalam
-# Docker tidak bergantung pada resolusi bawaan paketnya.
-Cython==3.0.12
+# Docker tidak bergantung pada resolusi bawaan paketnya. Cython sudah ditulis di
+# bagian perkakas bangun, jadi tidak diulang di sini.
 albumentations==1.4.2
 easydict==1.13
 prettytable==3.18.0

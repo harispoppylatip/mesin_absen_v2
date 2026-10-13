@@ -1,0 +1,33 @@
+# =====================================================================
+# Berkas yang TIDAK ikut masuk repositori
+#
+# Tanpa berkas ini, berkas hasil kerja yang besar dan berkas rahasia bisa
+# tidak sengaja ikut ter-commit. Yang paling berbahaya adalah folder `cache/`
+# yang memuat model terunduh (ratusan megabita) dan `.env` yang memuat
+# pengaturan khusus mesin.
+# =====================================================================
+
+# Model terunduh dan folder kerja. Isinya didapat ulang dengan
+# `python app.py --preload`, jadi tidak perlu ikut disimpan.
+cache/
+models/
+
+# Lingkungan Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Pengaturan khusus mesin
+.env
+
+# Berkas sementara saat mengukur dan menyelidiki
+*-hasil.txt
+ukur*.py
+selidik*.py
+cek-*.py
+
+# Berkas sistem
+.DS_Store
+Thumbs.db

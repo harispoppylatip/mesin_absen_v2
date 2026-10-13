@@ -34,9 +34,13 @@ FROM python:3.10-slim-bookworm AS pembangun
 # Python 3.10 dipilih karena itu versi yang dipakai saat seluruh pengukuran di
 # berkas catatan dilakukan, sehingga versi numpy, onnxruntime, dan opencv yang
 # terkunci di requirements.txt sudah terbukti cocok.
+# matplotlib memilih backend tampilan saat diimpor. Di dalam citra tidak ada
+# layar sama sekali, jadi backend Agg ditulis eksplisit supaya tidak bergantung
+# pada deteksi otomatis.
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLBACKEND=Agg
 
 RUN python -m venv /opt/venv
 
@@ -49,11 +53,30 @@ WORKDIR /bangun
 # waktu paling lama.
 COPY requirements.txt ./
 
+# LANGKAH 1: seluruh pustaka KECUALI insightface.
+#
+# Berkas requirements.txt sengaja tidak memuat insightface. Kalau paket itu
+# ditulis di sana, pip akan mencoba mengompilasi ekstensi C++ miliknya dan
+# pembangunan berhenti dengan galat asli yang pernah terjadi di server:
+#
+#     error: [Errno 2] No such file or directory: 'g++'
+#     ERROR: Failed building wheel for insightface
+#
+# Penjaga di bawah menghentikan pembangunan LEBIH AWAL dengan pesan yang jelas,
+# supaya kesalahan yang sama tidak terulang tanpa penjelasan.
+RUN python -c "import pathlib, sys; b = pathlib.Path('requirements.txt').read_text().splitlines(); sys.exit('requirements.txt memuat insightface. Jalankan tambal_insightface.py sebagai gantinya.') if any(x.strip().lower().startswith('insightface') for x in b) else None"
+
 RUN pip install --upgrade pip \
  && pip install -r requirements.txt
 
-# Tambalan insightface. Satu berkas ini dipakai bersama Windows dan Linux, jadi
-# tidak ada dua salinan logika tambalan yang harus diubah bersamaan.
+# LANGKAH 2: insightface, lewat tambalan.
+#
+# Satu berkas ini dipakai bersama Windows dan Linux, jadi tidak ada DUA salinan
+# logika tambalan yang harus diubah bersamaan. Skripnya mengunduh berkas sumber
+# insightface, mematikan ekstensi C++-nya, memasang pengganti Python murni, lalu
+# memasangnya dengan --no-build-isolation --no-deps. Sesudah itu skripnya
+# MENGIMPOR paketnya sendiri, sehingga citra gagal dibangun di sini, bukan gagal
+# saat dipakai, bila ada yang kurang.
 COPY tambal_insightface.py ./
 
 RUN python tambal_insightface.py
@@ -90,8 +113,11 @@ RUN apt-get update \
       libglib2.0-0 \
  && rm -rf /var/lib/apt/lists/*
 
+# Backend matplotlib ditulis eksplisit, karena di dalam wadah tidak ada layar
+# sama sekali dan deteksi otomatis tidak perlu diandalkan.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    MPLBACKEND=Agg \
     PATH="/opt/venv/bin:$PATH" \
     FACE_HOST=0.0.0.0 \
     FACE_PORT=5005 \

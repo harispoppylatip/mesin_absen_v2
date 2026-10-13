@@ -47,6 +47,32 @@ python -m venv .venv
 .\.venv\Scripts\python.exe absen-solat\app.py
 ```
 
+Dua hal tentang perintah di atas:
+
+**Baris `tambal_insightface.py` WAJIB dan jangan dilewatkan.** `requirements.txt`
+sengaja TIDAK memuat insightface, sebab `pip install insightface` selalu mencoba
+mengompilasi satu ekstensi C++ yang hanya dipakai render topeng wajah 3D.
+Kompilasi itu gagal di Windows tanpa Visual Studio Build Tools, dan gagal juga di
+server Linux yang tidak memasang `g++`:
+
+```
+error: [Errno 2] No such file or directory: 'g++'
+ERROR: Failed building wheel for insightface
+```
+
+Skrip itu mematikan ekstensi tersebut, memasang pengganti murni Python, lalu
+memasang paketnya tanpa compiler. Skrip yang sama dipakai oleh `Dockerfile`,
+jadi tidak ada dua salinan logika tambalan. Langkah itu juga menutup pemeriksaan
+terakhir dengan MENGIMPOR paketnya, sehingga kekurangan apa pun terlihat di situ,
+bukan nanti saat layanan dipakai.
+
+**`requirements.txt` mendaftarkan matplotlib secara sengaja.** Sekilas terdengar
+aneh, sebab layanan ini tidak pernah menggambar grafik. Alasannya rantai impor:
+`insightface.app` mengimpor `mask_renderer`, yang mengimpor `thirdparty.face3d`,
+yang mengimpor `mesh`, dan `mesh/__init__.py` menulis `from . import vis`,
+sedangkan `vis.py` memakai matplotlib. Tanpa matplotlib, `import insightface`
+gagal sebelum baris apa pun di `app.py` sempat berjalan.
+
 Bila model sudah ada di folder lain, arahkan lewat `FACE_MODEL_ROOT`. Contoh:
 `$env:FACE_MODEL_ROOT="C:\Users\Pongo\Documents\IoT\instighface\cache\models"`.
 

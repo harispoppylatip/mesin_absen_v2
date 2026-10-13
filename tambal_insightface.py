@@ -28,6 +28,17 @@ dipakai oleh Windows maupun Linux.
 
 PEMAKAIAN
 ---------
+    pip install -r requirements.txt        lalu     python tambal_insightface.py
+
+URUTANNYA WAJIB, dan alasannya begini: requirements.txt SENGAJA tidak memuat
+insightface. Kalau paket itu ditulis di sana, `pip install -r requirements.txt`
+akan mencoba mengompilasi ekstensi C++-nya sendiri dan gagal sebelum skrip ini
+sempat berjalan, persis seperti yang pernah terjadi di server:
+
+    error: [Errno 2] No such file or directory: 'g++'
+    ERROR: Failed building wheel for insightface
+
+Pemakaian langsung:
     python tambal_insightface.py                  pasang memakai python ini
     python tambal_insightface.py --pip <python>   pasang ke python lain
     python tambal_insightface.py --kerja <folder> tentukan folder kerja
@@ -101,8 +112,19 @@ def __getattr__(name: str):
     raise NotImplementedError(f"{_PESAN} Fungsi yang diminta: {name}()")
 '''
 
+# Program kecil yang dijalankan sesudah pemasangan berhasil. Isinya SENGAJA
+# menyentuh tiga hal: paket utamanya, pemakaian nyatanya (FaceAnalysis), dan
+# modul penggantinya. Kalau salah satu hilang, verifikasi ini gagal.
+VERIFIKASI = """import insightface
+from insightface.app import FaceAnalysis
+from insightface.thirdparty.face3d.mesh.cython import mesh_core_cython
+print('    insightface', insightface.__version__, 'siap dipakai')
+print('    FaceAnalysis tersedia:', bool(FaceAnalysis))
+print('    pengganti mesh_core_cython terpasang di', mesh_core_cython.__file__)
+"""
 
-def jalan(perintah: list[str], keterangan: str, tampilkan: bool = False) -> None:
+
+def jalan(perintah: list[str], keterangan: str) -> None:
     """Jalankan satu perintah, hentikan bila gagal."""
     print(f"  {keterangan}")
 
@@ -113,8 +135,37 @@ def jalan(perintah: list[str], keterangan: str, tampilkan: bool = False) -> None
         print(hasil.stderr[-4000:], file=sys.stderr)
         raise SystemExit(f"gagal: {' '.join(perintah)}")
 
-    if tampilkan and hasil.stdout.strip():
-        print(hasil.stdout.rstrip())
+
+def verifikasi(pip: str) -> None:
+    """Pastikan paketnya benar benar bisa diimpor SESUDAH dipasang.
+
+    Sengaja mengimpor rantai penuhnya, termasuk modul pengganti, sebab dua
+    kegagalan yang paling mudah terjadi justru TIDAK terlihat dari sekadar
+    `import insightface`:
+
+      * berkas pengganti tidak ikut terpasang ke dalam paket, sehingga
+        `from .cython import mesh_core_cython` gagal. Ini bisa terjadi bila
+        direktori itu tidak dikenali sebagai paket saat roda dibangun.
+      * ada pustaka yang dibutuhkan SAAT IMPOR tetapi belum terpasang. Yang
+        paling mudah terlewat adalah matplotlib, sebab berkas yang memakainya
+        (`thirdparty/face3d/mesh/vis.py`) tersembunyi jauh di dalam rantai:
+        insightface.app -> mask_renderer -> thirdparty.face3d -> mesh -> vis.
+    """
+    print("  memverifikasi ...")
+
+    hasil = subprocess.run([pip, "-c", VERIFIKASI], capture_output=True, text=True)
+
+    if hasil.returncode != 0:
+        print(hasil.stdout[-2000:])
+        print(hasil.stderr[-4000:], file=sys.stderr)
+        print()
+        print("  insightface terpasang, tetapi paketnya belum bisa diimpor.")
+        print("  Periksa dua hal ini lebih dulu:")
+        print("    1. seluruh isi requirements.txt sudah terpasang, terutama matplotlib")
+        print("    2. berkas pengganti mesh_core_cython ikut terpasang ke dalam paket")
+        raise SystemExit("verifikasi gagal")
+
+    print(hasil.stdout.rstrip())
 
 
 def tambal(sumber: Path) -> Path:
@@ -174,8 +225,32 @@ def main() -> int:
             sumber = Path(argumen.sumber)
         else:
             print("  mengunduh berkas sumber ...")
+            # --no-build-isolation juga WAJIB di langkah unduh ini, bukan hanya
+            # saat memasang.
+            #
+            # Tanpanya pip membuat lingkungan terpisah dan MENGUNDUH ulang
+            # setuptools, numpy, serta cython hanya untuk bisa membaca metadata
+            # paketnya. Unduhan tambahan itu membuat langkah ini rapuh tanpa
+            # manfaat apa pun, dan sudah pernah gagal di percobaan pertama:
+            #
+            #     Installing build dependencies: started
+            #     Installing build dependencies: finished with status 'error'
+            #
+            # lalu berhasil begitu dijalankan ulang. Seluruh isi [build-system]
+            # insightface sudah dipasang oleh requirements.txt tepat sebelum
+            # langkah ini, jadi lingkungan terpisah memang tidak diperlukan.
             jalan(
-                [argumen.pip, "-m", "pip", "download", f"insightface=={VERSI}", "--no-deps", "-d", str(kerja)],
+                [
+                    argumen.pip,
+                    "-m",
+                    "pip",
+                    "download",
+                    f"insightface=={VERSI}",
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "-d",
+                    str(kerja),
+                ],
                 "unduh selesai",
             )
 
@@ -202,12 +277,7 @@ def main() -> int:
             "pemasangan selesai",
         )
 
-        print("  memverifikasi ...")
-        jalan(
-            [argumen.pip, "-c", "import insightface; from insightface.app import FaceAnalysis; print('    insightface', insightface.__version__, 'siap dipakai')"],
-            "verifikasi selesai",
-            tampilkan=True,
-        )
+        verifikasi(argumen.pip)
     finally:
         if milik_sendiri and not argumen.sisakan:
             shutil.rmtree(kerja, ignore_errors=True)
