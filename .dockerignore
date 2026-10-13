@@ -1,0 +1,45 @@
+# =====================================================================
+# .dockerignore untuk layanan wajah InsightFace
+#
+# Dockerfile hanya menyalin tiga berkas yang memang dibutuhkan (requirements.txt,
+# tambal_insightface.py, app.py) ditambah verifikasi.py, jadi berkas di daftar
+# ini sebenarnya tidak akan masuk citra. Isinya penting untuk hal lain: kalau
+# tidak diabaikan, folder model hasil `--preload` di komputer ikut dikirim ke
+# mesin Docker setiap kali membangun citra. Folder itu 600 MB lebih, dan seluruh
+# isinya dikirim lewat jaringan ke daemon, sehingga pembangunan citra menjadi
+# sangat lambat tanpa sebab yang jelas.
+# =====================================================================
+
+# Model dan folder kerja lokal
+cache/
+models/
+faces/
+.venv/
+venv/
+
+# Berkas Python hasil kompilasi
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Rahasia dan pengaturan lokal
+.env
+
+# Berkas sementara saat mengukur dan menyelidiki
+ukur.py
+ukur2.py
+selidik.py
+*-hasil.txt
+hapus-sidik-lama.php
+uji-rantai-nyata.php
+*.php
+
+# Dokumentasi tidak dibutuhkan di dalam citra
+*.md
+LICENSE
+
+# Berkas sistem
+.git/
+.gitignore
+.DS_Store
+Thumbs.db

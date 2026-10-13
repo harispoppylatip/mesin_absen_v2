@@ -1,0 +1,54 @@
+# Kebutuhan layanan wajah InsightFace untuk aplikasi absen solat.
+#
+# Pemasangan di Windows:
+#     python -m venv .venv
+#     .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Di Linux dan di dalam Docker, berkas yang sama dipakai apa adanya: baris
+# opencv memakai penanda lingkungan, jadi Windows mendapat opencv yang bisa
+# membuka jendela sedangkan Linux mendapat versi tanpa tampilan supaya tidak
+# perlu memasang pustaka grafik di dalam citra.
+#
+# Catatan tentang insightface 0.7.3
+# ---------------------------------
+# Paketnya hanya tersedia sebagai kode sumber. Di Windows, berkas setup.py-nya
+# memaksa kompilasi modul Cython `mesh_core_cython` yang hanya dipakai untuk
+# render wajah 3D, dan kompilasi itu gagal tanpa Visual Studio Build Tools.
+# Skrip `install-insightface.ps1` di folder induk mengurus itu: mengosongkan
+# `ext_modules`, menambahkan pengganti murni Python untuk mesh_core_cython,
+# lalu memasangnya dengan `--no-build-isolation`. Modul itu tidak pernah
+# dipanggil oleh deteksi maupun pengenalan wajah.
+#
+# Di dalam Docker pemasangan berjalan normal tanpa skrip itu, karena dasar
+# citranya sudah memuat perkakas bangun (lihat Dockerfile).
+
+# --- angka dan gambar -------------------------------------------------
+numpy==1.26.4
+Pillow==12.3.0
+opencv-python-headless==4.11.0.86 ; sys_platform != "win32"
+opencv-python==4.11.0.86 ; sys_platform == "win32"
+
+# --- mesin wajah ------------------------------------------------------
+# CPU saja. Untuk kartu grafis NVIDIA, ganti jadi onnxruntime-gpu dan setel
+# FACE_USE_GPU=1. Versi CPU sengaja dipilih karena inilah yang terpasang dan
+# terukur di mesin ini.
+onnxruntime==1.23.2
+onnx==1.23.2
+insightface==0.7.3
+
+# Kebutuhan langsung InsightFace, ditulis terpisah supaya pemasangan di dalam
+# Docker tidak bergantung pada resolusi bawaan paketnya.
+Cython==3.0.12
+albumentations==1.4.2
+easydict==1.13
+prettytable==3.18.0
+requests==2.34.2
+scikit-image==0.25.2
+scikit-learn==1.7.2
+scipy==1.15.3
+tqdm==4.70.1
+
+# --- layanan HTTP -----------------------------------------------------
+fastapi==0.143.0
+uvicorn==0.54.0
+python-multipart==0.0.32

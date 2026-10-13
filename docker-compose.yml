@@ -1,0 +1,93 @@
+# =====================================================================
+# Layanan wajah InsightFace untuk aplikasi absen solat
+#
+#     docker network create absen-jaringan     (sekali saja)
+#     docker compose build
+#     docker compose up -d
+#     docker compose logs -f wajah
+#
+# Nama layanan sengaja "wajah", karena itulah nama yang sudah dipakai berkas
+# .env aplikasi Laravel: FACE_SERVICE_URL_DOCKER=http://wajah:5005. Dengan
+# begitu tidak ada yang perlu diubah di sisi aplikasi.
+# =====================================================================
+
+name: layanan-wajah-insightface
+
+services:
+  wajah:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: layanan-wajah-insightface:1.0.0
+    container_name: wajah-insightface
+    restart: unless-stopped
+
+    environment:
+      # Model. Ganti ke buffalo_l hanya bila memang perlu: model itu sekitar
+      # 20 kali lebih besar dan delapan kali lebih lambat menghitung angka
+      # wajah pada CPU tanpa kartu grafis.
+      FACE_MODEL: ${FACE_MODEL:-buffalo_sc}
+      FACE_MODEL_NAME: ${FACE_MODEL_NAME:-insightface-buffalo_sc}
+      FACE_DIMENSIONS: "512"
+
+      # Bentuk kanvas detektor. Mengikuti rasio gambar terbukti hampir dua kali
+      # lebih cepat pada gambar 1280x720 karena kanvas persegi hanya terisi
+      # sebagian dan sisanya padding nol yang tetap dihitung model.
+      FACE_DETECT_LONG_SIDE: ${FACE_DETECT_LONG_SIDE:-640}
+      FACE_DETECT_MATCH_ASPECT: "1"
+      FACE_DET_THRESHOLD: ${FACE_DET_THRESHOLD:-0.5}
+      FACE_MAX_FACES: ${FACE_MAX_FACES:-8}
+
+      # Jumlah thread. PENTING: nilainya sebaiknya SAMA dengan batas cpu di
+      # bawah. Diukur pada i7-13620H, satu wajah, median 30 kali:
+      #     intra 1 -> 42,9 ms | intra 2 -> 26,6 ms
+      #     intra 4 -> 21,1 ms | intra 8 -> 27,9 ms
+      # Empat adalah titik terbaiknya. Menambah thread MELEBIHI jumlah core
+      # yang tersedia justru memperlambat, karena thread saling berebut.
+      FACE_ORT_INTRA_THREADS: ${FACE_ORT_INTRA_THREADS:-4}
+      FACE_ORT_INTER_THREADS: "1"
+      FACE_OPENCV_THREADS: "1"
+
+      FACE_PROOF_MAX_SIDE: "480"
+      FACE_PROOF_QUALITY: "72"
+      FACE_PROOF_MAX_KB: "48"
+      FACE_LOG_LEVEL: ${FACE_LOG_LEVEL:-INFO}
+
+    ports:
+      # Dipublikasikan HANYA ke 127.0.0.1 secara bawaan, karena layanan ini
+      # tidak punya kata sandi sama sekali. Alamat ini diperlukan bila aplikasi
+      # Laravel dijalankan langsung di komputer (php artisan serve), sebab
+      # FACE_SERVICE_URL-nya menunjuk http://127.0.0.1:5005.
+      #
+      # Bila kedua duanya berjalan sebagai container, publikasi port ini tidak
+      # diperlukan sama sekali: aplikasi menghubungi http://wajah:5005 lewat
+      # jaringan bersama. Untuk membukanya ke komputer lain di jaringan
+      # sekolah, ubah FACE_PUBLISH_HOST di berkas .env.
+      - "${FACE_PUBLISH_HOST:-127.0.0.1}:${FACE_PUBLISH_PORT:-5005}:5005"
+
+    # Batas sumber daya diambil dari pengukuran, bukan dari dugaan:
+    # memori   : puncak 256 MB setelah melayani lebih dari 50 permintaan dengan
+    #            model buffalo_sc. Batas 768 MB memberi ruang sekitar tiga kali.
+    #            Naikkan bila memakai buffalo_l, yang bobotnya saja 326 MB.
+    # cpu      : 4,0 disamakan dengan FACE_ORT_INTRA_THREADS di atas.
+    #            Pada server dua core, setel FACE_CPUS=2 dan
+    #            FACE_ORT_INTRA_THREADS=2.
+    mem_limit: ${FACE_MEMORY_LIMIT:-768m}
+    cpus: ${FACE_CPUS:-4.0}
+
+    networks:
+      absen-jaringan:
+        aliases:
+          # Nama tambahan supaya alamat http://wajah:5005 tetap bekerja walau
+          # nama layanan ini suatu saat diubah.
+          - wajah
+
+networks:
+  absen-jaringan:
+    # Jaringan bersama dengan aplikasi web. Dibuat di luar compose dengan
+    #     docker network create absen-jaringan
+    # alasannya: dua berkas compose yang berdiri sendiri (layanan wajah di
+    # folder ini dan aplikasi web di folder lain) perlu bertemu di satu
+    # jaringan, dan jaringan bawaan compose selalu dibuat ulang per proyek.
+    external: true
+    name: absen-jaringan
