@@ -157,6 +157,42 @@ PROOF_MAX_KB = _angka(os.getenv("FACE_PROOF_MAX_KB"), 48)
 PROOF_MAX_BYTES = PROOF_MAX_KB * 1024
 PROOF_QUALITIES = tuple(max(30, PROOF_QUALITY - langkah * 8) for langkah in range(5))
 
+# --- Mutu foto pendaftaran ------------------------------------------
+# Pemeriksaan ini HANYA dijalankan bila pemanggil meminta `quality=1`. Alur
+# absen di gerbang tidak memintanya, sehingga aturan pencatatan kehadiran yang
+# sudah berjalan tidak ikut berubah saat ambang di bawah ini disetel.
+#
+# Seluruh angka di bawah ini diukur dari 34 foto sungguhan lima orang di folder
+# faces/ pada 2026-10-14, bukan ditentukan dengan perkiraan. Sebaran yang
+# terukur adalah:
+#
+#   kecerahan : 64,98 sampai 165,91 (p5 93,16 p50 134,03)
+#   ketajaman : 37,37 sampai 1108,66 (p1 39,15 p50 296,07)
+#   yaw       : 0,0016 sampai 1,2655 (p75 0,1133 p95 0,6174)
+#   roll      : 0,0025 sampai 0,7050 (p75 0,2945 p95 0,4705)
+#   pitch     : 0,3519 sampai 0,7308 (p5 0,3995 p95 0,6970)
+#
+# Ambangnya sengaja diletakkan DI LUAR sebaran itu, dengan jarak yang masih
+# terlihat, supaya foto yang sah tidak ikut ditolak dan hanya foto yang memang
+# tidak layak yang gagal. Data boleh diukur ulang dengan cara yang sama saat
+# jumlah foto bertambah banyak.
+#
+# Kecerahan rata-rata bagian tengah wajah, skala 0 sampai 255.
+MIN_FACE_BRIGHTNESS = _angka(os.getenv("FACE_MIN_BRIGHTNESS"), 50)
+MAX_FACE_BRIGHTNESS = _angka(os.getenv("FACE_MAX_BRIGHTNESS"), 238)
+# Ragam Laplacian. Semakin kecil, semakin buram gambarnya. Potongan wajah
+# diseragamkan ke ukuran ini lebih dulu supaya satu ambang berlaku untuk semua
+# besar wajah.
+MIN_FACE_SHARPNESS = _angka(os.getenv("FACE_MIN_SHARPNESS"), 25)
+QUALITY_SHARPNESS_SIDE = _angka(os.getenv("FACE_QUALITY_SIDE"), 128)
+# Arah hadap, semuanya dibagi jarak antar mata supaya tidak bergantung besar
+# wajah di dalam bingkai. `pitch` adalah posisi hidung di antara garis mata dan
+# garis mulut: makin kecil, makin mendongak; makin besar, makin menunduk.
+MAX_FACE_YAW = _pecahan(os.getenv("FACE_MAX_YAW"), 0.60)
+MAX_FACE_ROLL = _pecahan(os.getenv("FACE_MAX_ROLL"), 0.50)
+MIN_FACE_PITCH = _pecahan(os.getenv("FACE_MIN_PITCH"), 0.28)
+MAX_FACE_PITCH = _pecahan(os.getenv("FACE_MAX_PITCH"), 0.92)
+
 # --- Pemanasan ------------------------------------------------------
 # Panggilan pengenalan pertama bisa tujuh kali lebih lambat daripada panggilan
 # berikutnya. Pemanasan saat mulai memindahkan biaya itu ke waktu tunggu
@@ -297,6 +333,159 @@ def proof_photo(frame: "Any", max_side: int = PROOF_MAX_SIDE) -> dict[str, Any] 
         return None
 
 
+def face_quality(frame: "Any", box: tuple[int, int, int, int], kps: "Any | None" = None) -> dict[str, Any]:
+    """Ukur mutu satu wajah: kecerahan, ketajaman, dan arah hadap.
+
+    Dipakai halaman pendaftaran wajah untuk menolak foto yang tidak layak
+    SEBELUM angkanya disimpan. Tanpa pemeriksaan ini, satu kelas yang mendaftar
+    serentak di ruangan gelap atau sambil bergerak akan menghasilkan data wajah
+    yang terlihat sah padahal tidak bisa dipakai mengenali siapa pun, dan
+    kesalahannya baru ketahuan berbulan-bulan kemudian saat absen gagal.
+
+    Kecerahan diukur dari bagian tengah wajah saja, bukan seluruh kotak.
+    Alasannya rambut, dahi, dan latar di pinggir kotak ikut terhitung pada
+    seluruh kotak, sehingga wajah yang sebenarnya cukup terang bisa terlihat
+    gelap hanya karena latar di pinggirnya gelap.
+
+    Ketajaman memakai ragam (variance) Laplacian. Angka ini kecil pada gambar
+    yang buram karena tepi-tepinya tidak tajam, dan tidak dipengaruhi besar
+    wajah karena memakai potongan wajahnya sendiri.
+
+    Arah hadap diturunkan dari lima titik wajah InsightFace dengan urutan mata
+    kiri, mata kanan, hidung, sudut mulut kiri, sudut mulut kanan. Semua
+    hasilnya dibagi jarak antar mata supaya angkanya tidak berubah mengikuti
+    besar wajah di dalam bingkai.
+    """
+    import cv2
+    import numpy as np
+
+    hasil: dict[str, Any] = {
+        "brightness": 0.0,
+        "sharpness": 0.0,
+        "yaw": None,
+        "roll": None,
+        "pitch": None,
+    }
+
+    tinggi, lebar = frame.shape[:2]
+    x1 = max(0, min(int(box[0]), lebar))
+    x2 = max(0, min(int(box[2]), lebar))
+    y1 = max(0, min(int(box[1]), tinggi))
+    y2 = max(0, min(int(box[3]), tinggi))
+
+    potong = frame[y1:y2, x1:x2]
+
+    if potong.size == 0:
+        return hasil
+
+    try:
+        abu = cv2.cvtColor(potong, cv2.COLOR_BGR2GRAY)
+
+        # Potongan wajah diseragamkan lebih dulu ke sisi tetap sebelum diukur.
+        # Alasannya ragam Laplacian bergantung besar gambar: potongan wajah 600
+        # piksel menghasilkan angka lebih kecil daripada potongan 200 piksel
+        # untuk ketajaman yang sama, sehingga satu ambang tidak bisa dipakai
+        # untuk kedua ukuran itu. Setelah diseragamkan, ambangnya bisa dibaca
+        # sebagai "seketejam apa potongan wajah 128 piksel ini".
+        sisi_acuan = QUALITY_SHARPNESS_SIDE
+
+        if abu.shape[0] != sisi_acuan or abu.shape[1] != sisi_acuan:
+            # INTER_AREA untuk memperkecil, INTER_LINEAR untuk memperbesar:
+            # mengecilkan dengan INTER_LINEAR justru membuang detail tepi yang
+            # sedang diukur.
+            interpolasi = cv2.INTER_AREA if min(abu.shape[:2]) > sisi_acuan else cv2.INTER_LINEAR
+            abu = cv2.resize(abu, (sisi_acuan, sisi_acuan), interpolation=interpolasi)
+    except Exception as galat:  # noqa: BLE001
+        logger.warning("mutu wajah gagal diukur: %s", galat)
+
+        return hasil
+
+    hasil["sharpness"] = round(float(cv2.Laplacian(abu, cv2.CV_64F).var()), 2)
+
+    # Bagian tengah 60 persen: memuat pipi dan dahi, membuang rambut dan latar.
+    sh, sw = abu.shape[:2]
+    atas, bawah = int(sh * 0.2), max(int(sh * 0.2) + 1, int(sh * 0.8))
+    kiri, kanan = int(sw * 0.2), max(int(sw * 0.2) + 1, int(sw * 0.8))
+    hasil["brightness"] = round(float(np.mean(abu[atas:bawah, kiri:kanan])), 2)
+
+    if kps is None:
+        return hasil
+
+    titik = np.asarray(kps, dtype=np.float64)
+
+    if titik.shape[0] < 5:
+        return hasil
+
+    kiri_mata = titik[0]
+    kanan_mata = titik[1]
+    hidung = titik[2]
+    kiri_mulut = titik[3]
+    kanan_mulut = titik[4]
+
+    jarak_mata = float(np.linalg.norm(kanan_mata - kiri_mata))
+
+    if not np.isfinite(jarak_mata) or jarak_mata <= 0:
+        return hasil
+
+    tengah_mata = (kiri_mata + kanan_mata) / 2.0
+    tengah_mulut = (kiri_mulut + kanan_mulut) / 2.0
+    jarak_tegak = float(tengah_mulut[1] - tengah_mata[1])
+
+    hasil["yaw"] = round(abs(float(hidung[0] - tengah_mata[0])) / jarak_mata, 4)
+    hasil["roll"] = round(abs(float(kiri_mata[1] - kanan_mata[1])) / jarak_mata, 4)
+
+    if abs(jarak_tegak) > 1e-6:
+        hasil["pitch"] = round(float(hidung[1] - tengah_mata[1]) / jarak_tegak, 4)
+
+    return hasil
+
+
+def quality_problem(quality: "dict[str, Any] | None") -> "tuple[str, str] | None":
+    """Tentukan status penolakan dari hasil pengukuran mutu.
+
+    Urutannya sengaja dari yang paling sering terjadi dan paling mudah
+    diperbaiki pengguna, supaya petunjuk yang muncul adalah petunjuk yang
+    paling berguna. Satu foto hanya dilaporkan satu masalah.
+    """
+    if not quality:
+        return None
+
+    kecerahan = float(quality.get("brightness") or 0.0)
+
+    if MIN_FACE_BRIGHTNESS > 0 and kecerahan < MIN_FACE_BRIGHTNESS:
+        return ("too_dark", "Fotonya terlalu gelap. Cari tempat yang lebih terang, lalu ambil ulang.")
+
+    if MAX_FACE_BRIGHTNESS > 0 and kecerahan > MAX_FACE_BRIGHTNESS:
+        return ("too_bright", "Fotonya terlalu terang sampai wajah sulit dibaca. Jangan menghadap lampu langsung.")
+
+    ketajaman = float(quality.get("sharpness") or 0.0)
+
+    if MIN_FACE_SHARPNESS > 0 and ketajaman < MIN_FACE_SHARPNESS:
+        return ("blurry", "Fotonya kurang tajam. Pegang kamera dengan tenang, lalu ambil ulang.")
+
+    if MAX_FACE_YAW > 0:
+        nilai = quality.get("yaw")
+
+        if nilai is not None and abs(float(nilai)) > MAX_FACE_YAW:
+            return ("bad_pose", "Wajah menghadap terlalu ke samping. Hadapkan wajah lurus ke kamera.")
+
+    if MAX_FACE_ROLL > 0:
+        nilai = quality.get("roll")
+
+        if nilai is not None and abs(float(nilai)) > MAX_FACE_ROLL:
+            return ("bad_pose", "Kepala terlalu miring. Tegakkan kepala, lalu ambil ulang.")
+
+    nilai = quality.get("pitch")
+
+    if nilai is not None:
+        sudut = float(nilai)
+
+        if (MIN_FACE_PITCH > 0 and sudut < MIN_FACE_PITCH) or (MAX_FACE_PITCH > 0 and sudut > MAX_FACE_PITCH):
+            return ("bad_pose", "Wajah terlalu mendongak atau menunduk. Hadapkan wajah lurus ke kamera.")
+
+    return None
+
+
 # =====================================================================
 # MESIN WAJAH
 # =====================================================================
@@ -386,6 +575,7 @@ class FaceEngine:
         *,
         need_embeddings: bool = True,
         min_face_size: int = EMBED_MIN_FACE_SIZE,
+        with_quality: bool = False,
     ) -> list[dict[str, Any]]:
         """Deteksi semua wajah, lalu hitung angkanya HANYA bila akan dipakai.
 
@@ -397,6 +587,11 @@ class FaceEngine:
 
         Urutan hasil mengikuti besar kotak, dari yang terbesar, karena wajah
         terbesar biasanya orang yang paling dekat dengan kamera.
+
+        `with_quality` menambahkan pengukuran mutu (kecerahan, ketajaman, arah
+        hadap) pada setiap wajah. Pengukurannya murah, tetapi tetap hanya
+        dikerjakan bila diminta supaya alur absen yang sudah berjalan tidak
+        berubah sama sekali.
         """
         import numpy as np
         from insightface.app.common import Face
@@ -489,6 +684,15 @@ class FaceEngine:
                     "det_score": round(det_score, 4),
                     "encoding": encoding,
                     "error": kesalahan,
+                    "quality": (
+                        face_quality(
+                            image,
+                            (x1, y1, x2, y2),
+                            None if kpss is None else kpss[index],
+                        )
+                        if with_quality
+                        else None
+                    ),
                 }
             )
 
@@ -640,6 +844,7 @@ def build_app() -> "Any":
         image: UploadFile = File(..., description="Berkas foto, field bernama image"),
         with_photo: str | None = Query(None),
         require_single: str | None = Query(None),
+        quality: str | None = Query(None),
     ) -> JSONResponse:
         """Hitung angka wajah untuk SATU orang.
 
@@ -647,9 +852,16 @@ def build_app() -> "Any":
         lebih dari satu wajah, yang dipakai adalah wajah terbesar, kecuali
         `require_single=1` diminta: saat itu foto ditolak supaya alur absen tidak
         diam-diam memakai wajah orang lain.
+
+        `quality=1` menambahkan pemeriksaan mutu foto dan MENOLAK foto yang
+        terlalu gelap, terlalu terang, buram, atau wajahnya menghadap terlalu
+        jauh dari kamera. Pemeriksaan itu sengaja tidak dijalankan secara bawaan:
+        alur absen di gerbang tidak boleh ikut berubah ketika ambang mutu
+        disetel untuk pendaftaran.
         """
         minta_bukti = _benar(with_photo)
         satu_saja = _benar(require_single)
+        minta_mutu = _benar(quality)
 
         if not ENGINE.ready:
             return JSONResponse(
@@ -673,7 +885,7 @@ def build_app() -> "Any":
         mulai = time.perf_counter()
         # Pada jalur satu orang, angka wajah selalu dihitung: hanya ada satu
         # wajah, jadi menghemat di sini tidak ada gunanya.
-        wajah = ENGINE.analyze(frame, need_embeddings=True, min_face_size=0)
+        wajah = ENGINE.analyze(frame, need_embeddings=True, min_face_size=0, with_quality=minta_mutu)
         detik = time.perf_counter() - mulai
 
         if not wajah:
@@ -701,6 +913,28 @@ def build_app() -> "Any":
                 )
             )
 
+        # Mutu diperiksa SETELAH angkanya ada, sebab foto yang wajahnya tidak
+        # terbaca sama sekali sudah ditolak lebih dulu dengan pesan yang lebih
+        # tepat. Diperiksa SEBELUM balasan sukses, supaya angka yang tidak layak
+        # tidak pernah sempat disimpan pemanggil.
+        masalah = quality_problem(utama.get("quality")) if minta_mutu else None
+
+        if masalah is not None:
+            logger.info(
+                "mutu foto ditolak (%s): %s",
+                masalah[0],
+                utama.get("quality"),
+            )
+
+            return JSONResponse(
+                _balasan_refusal(
+                    masalah[0],
+                    masalah[1],
+                    face_count=len(wajah),
+                    face_size=utama["face_size"],
+                )
+            )
+
         logger.info(
             "encode %sx%s: %s wajah dalam %.1f ms",
             frame.shape[1],
@@ -716,6 +950,7 @@ def build_app() -> "Any":
             "face_size": utama["face_size"],
             "model": _iris_model(),
             "message": "Wajah terbaca.",
+            "quality": utama.get("quality"),
         }
 
         return JSONResponse(_terapkan_opsi(balasan, frame, minta_bukti))
@@ -724,6 +959,7 @@ def build_app() -> "Any":
     async def detect(
         image: UploadFile = File(..., description="Berkas foto, field bernama image"),
         with_photo: str | None = Query(None),
+        quality: str | None = Query(None),
     ) -> JSONResponse:
         """Hitung angka wajah untuk SELURUH wajah di satu bingkai.
 
@@ -735,8 +971,14 @@ def build_app() -> "Any":
         Wajah yang angkanya gagal dihitung tetap dilaporkan dengan `encoding`
         bernilai null, supaya satu wajah yang gagal tidak menggagalkan wajah
         lain dan halaman tetap bisa menggambar kotaknya.
+
+        Di sini `quality=1` hanya MENAMBAHKAN keterangan mutu pada setiap wajah
+        dan tidak pernah menolak, sebab satu bingkai bisa memuat banyak orang
+        dan menolak seluruh bingkai karena satu wajah yang gelap akan
+        menghentikan absen orang lain.
         """
         minta_bukti = _benar(with_photo)
+        minta_mutu = _benar(quality)
 
         kosong: dict[str, Any] = {
             "status": "no_face",
@@ -760,7 +1002,12 @@ def build_app() -> "Any":
         tinggi, lebar = frame.shape[:2]
 
         mulai = time.perf_counter()
-        wajah = ENGINE.analyze(frame, need_embeddings=True, min_face_size=EMBED_MIN_FACE_SIZE)
+        wajah = ENGINE.analyze(
+            frame,
+            need_embeddings=True,
+            min_face_size=EMBED_MIN_FACE_SIZE,
+            with_quality=minta_mutu,
+        )
         detik = time.perf_counter() - mulai
 
         if not wajah:
@@ -781,6 +1028,7 @@ def build_app() -> "Any":
                     "face_size": satu["face_size"],
                     "encoding": satu["encoding"],
                     "error": satu["error"],
+                    "quality": satu.get("quality"),
                 }
             )
 
@@ -825,6 +1073,12 @@ def print_check() -> int:
     print(f"  batas wajah terkecil  : {EMBED_MIN_FACE_SIZE} px")
     print(f"  thread                : intra {ORT_INTRA_THREADS}, inter {ORT_INTER_THREADS}, opencv {OPENCV_THREADS}")
     print(f"  foto bukti            : sisi {PROOF_MAX_SIDE}, mutu {PROOF_QUALITY}, batas {PROOF_MAX_KB} KB")
+    print("  mutu pendaftaran      : hanya bila quality=1 diminta")
+    print(f"    kecerahan           : {MIN_FACE_BRIGHTNESS} sampai {MAX_FACE_BRIGHTNESS} (0 sampai 255)")
+    print(f"    ketajaman           : minimal {MIN_FACE_SHARPNESS} pada potongan {QUALITY_SHARPNESS_SIDE}x{QUALITY_SHARPNESS_SIDE}")
+    print(f"    yaw (maks)          : {MAX_FACE_YAW}")
+    print(f"    roll (maks)         : {MAX_FACE_ROLL}")
+    print(f"    pitch (min sampai maks): {MIN_FACE_PITCH} sampai {MAX_FACE_PITCH}")
     print()
     print("Pustaka")
 
