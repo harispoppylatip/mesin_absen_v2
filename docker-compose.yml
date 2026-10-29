@@ -53,6 +53,11 @@ services:
       FACE_PROOF_MAX_KB: "48"
       FACE_LOG_LEVEL: ${FACE_LOG_LEVEL:-INFO}
 
+      # Anti-Spoofing MiniFASNet ONNX Ensemble
+      FACE_ENABLE_ANTISPOOF: ${FACE_ENABLE_ANTISPOOF:-1}
+      FACE_ANTISPOOF_THRESHOLD: ${FACE_ANTISPOOF_THRESHOLD:-0.60}
+      FACE_ANTISPOOF_SCALE: ${FACE_ANTISPOOF_SCALE:-2.7}
+
     ports:
       # Dipublikasikan HANYA ke 127.0.0.1 secara bawaan, karena layanan ini
       # tidak punya kata sandi sama sekali. Alamat ini diperlukan bila aplikasi

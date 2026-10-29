@@ -193,6 +193,14 @@ MAX_FACE_ROLL = _pecahan(os.getenv("FACE_MAX_ROLL"), 0.50)
 MIN_FACE_PITCH = _pecahan(os.getenv("FACE_MIN_PITCH"), 0.28)
 MAX_FACE_PITCH = _pecahan(os.getenv("FACE_MAX_PITCH"), 0.92)
 
+# --- Anti-Spoofing (Liveness Detection - MiniFASNet ONNX) -----------
+# Mendeteksi pemalsuan foto cetak (print attack), replay layar HP/monitor/tablet,
+# atau pantulan glare/kisi moire.
+ENABLE_ANTISPOOF = _benar(os.getenv("FACE_ENABLE_ANTISPOOF"), True)
+ANTISPOOF_THRESHOLD = _pecahan(os.getenv("FACE_ANTISPOOF_THRESHOLD"), 0.60)
+ANTISPOOF_SCALE = _pecahan(os.getenv("FACE_ANTISPOOF_SCALE"), 2.7)
+ANTISPOOF_MODEL_DIR = Path(os.getenv("FACE_ANTISPOOF_MODEL_DIR", str(MODEL_ROOT / "antispoof")))
+
 # --- Pemanasan ------------------------------------------------------
 # Panggilan pengenalan pertama bisa tujuh kali lebih lambat daripada panggilan
 # berikutnya. Pemanasan saat mulai memindahkan biaya itu ke waktu tunggu
@@ -487,6 +495,200 @@ def quality_problem(quality: "dict[str, Any] | None") -> "tuple[str, str] | None
 
 
 # =====================================================================
+# ANTI-SPOOFING (MiniFASNet ONNX Ensemble)
+# =====================================================================
+
+
+class AntiSpoofDetector:
+    """Detektor keaslian wajah (Liveness / Anti-Spoofing) menggunakan Ensemble MiniFASNet ONNX.
+
+    Menggabungkan dua skala model (resmi dari Minivision):
+      1. MiniFASNetV2  (scale 2.7) -> menangkap tekstur moire dan pantulan dekat
+      2. MiniFASNetV1SE (scale 4.0) -> menangkap bingkai HP/monitor dan konteks latar belakang
+    """
+
+    MODEL_V2_URL = "https://huggingface.co/garciafido/minifasnet-v2-anti-spoofing-onnx/resolve/main/minifasnet_v2.onnx"
+    MODEL_V1SE_URL = "https://huggingface.co/yakhyo/uniface-weights/resolve/main/minifasnet_v1se.onnx"
+    LABELS = ("Foto Kertas (Print)", "Asli (Live)", "Layar HP/Monitor (Replay)")
+
+    def __init__(
+        self,
+        model_dir: Path,
+        threshold: float = ANTISPOOF_THRESHOLD,
+        scale: float = ANTISPOOF_SCALE,
+        intra_threads: int = 1,
+        inter_threads: int = 1,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.model_v2_path = self.model_dir / "minifasnet_v2.onnx"
+        self.model_v1se_path = self.model_dir / "minifasnet_v1se.onnx"
+        self.threshold = threshold
+        self.scale = scale
+        self.session_v2: Any | None = None
+        self.session_v1se: Any | None = None
+        self.input_name_v2: str | None = None
+        self.input_name_v1se: str | None = None
+
+        self._ensure_models_exist()
+        self._init_sessions(intra_threads, inter_threads)
+
+    def _ensure_models_exist(self) -> None:
+        """Unduh model ONNX otomatis jika belum tersedia di disk lokal."""
+        import urllib.request
+
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        for path, url, name in [
+            (self.model_v2_path, self.MODEL_V2_URL, "MiniFASNetV2 (scale 2.7)"),
+            (self.model_v1se_path, self.MODEL_V1SE_URL, "MiniFASNetV1SE (scale 4.0)"),
+        ]:
+            if not path.is_file() or path.stat().st_size < 100_000:
+                logger.info("mengunduh model anti-spoof %s ke %s ...", name, path)
+                try:
+                    urllib.request.urlretrieve(url, str(path))
+                    logger.info("model %s berhasil diunduh (%d bytes)", name, path.stat().st_size)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("gagal mengunduh %s: %s", name, exc)
+
+    def _init_sessions(self, intra_threads: int, inter_threads: int) -> None:
+        try:
+            import onnxruntime as ort
+
+            sess_options = ort.SessionOptions()
+            if intra_threads > 0:
+                sess_options.intra_op_num_threads = intra_threads
+            if inter_threads > 0:
+                sess_options.inter_op_num_threads = inter_threads
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+            if self.model_v2_path.is_file():
+                self.session_v2 = ort.InferenceSession(
+                    str(self.model_v2_path), sess_options=sess_options, providers=["CPUExecutionProvider"]
+                )
+                self.input_name_v2 = self.session_v2.get_inputs()[0].name
+                logger.info("model anti-spoof MiniFASNetV2 siap")
+
+            if self.model_v1se_path.is_file():
+                self.session_v1se = ort.InferenceSession(
+                    str(self.model_v1se_path), sess_options=sess_options, providers=["CPUExecutionProvider"]
+                )
+                self.input_name_v1se = self.session_v1se.get_inputs()[0].name
+                logger.info("model anti-spoof MiniFASNetV1SE siap")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gagal memuat sesi onnxruntime anti-spoof: %s", exc)
+
+    @staticmethod
+    def crop_face(
+        image: "Any",
+        bbox: tuple[int, int, int, int],
+        scale: float = 2.7,
+        out_size: tuple[int, int] = (80, 80),
+    ) -> "Any":
+        """Potong area wajah dengan padding/skala ekstra agar bingkai HP/kertas ikut tertangkap."""
+        import cv2
+        import numpy as np
+
+        src_h, src_w = image.shape[:2]
+        x1, y1, x2, y2 = bbox
+        box_w = max(1, x2 - x1)
+        box_h = max(1, y2 - y1)
+
+        applied_scale = min((src_h - 1) / box_h, min((src_w - 1) / box_w, scale))
+        new_width = box_w * applied_scale
+        new_height = box_h * applied_scale
+        center_x = box_w / 2.0 + x1
+        center_y = box_h / 2.0 + y1
+
+        left_top_x = center_x - new_width / 2.0
+        left_top_y = center_y - new_height / 2.0
+        right_bottom_x = center_x + new_width / 2.0
+        right_bottom_y = center_y + new_height / 2.0
+
+        if left_top_x < 0:
+            right_bottom_x -= left_top_x
+            left_top_x = 0
+        if left_top_y < 0:
+            right_bottom_y -= left_top_y
+            left_top_y = 0
+        if right_bottom_x >= src_w:
+            s = right_bottom_x - src_w + 1
+            left_top_x -= s
+            right_bottom_x -= s
+        if right_bottom_y >= src_h:
+            s = right_bottom_y - src_h + 1
+            left_top_y -= s
+            right_bottom_y -= s
+
+        crop = image[
+            int(max(0, left_top_y)):int(min(src_h, right_bottom_y)) + 1,
+            int(max(0, left_top_x)):int(min(src_w, right_bottom_x)) + 1,
+        ]
+        if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
+            return np.zeros((out_size[1], out_size[0], 3), dtype=np.uint8)
+
+        return cv2.resize(crop, out_size)
+
+    def _infer_session(self, session: "Any", input_name: str, crop_img: "Any") -> "Any":
+        import numpy as np
+
+        blob = crop_img.astype(np.float32)
+        blob = np.transpose(blob, (2, 0, 1))[np.newaxis, :]
+        outputs = session.run(None, {input_name: blob})[0][0]
+        e_x = np.exp(outputs - np.max(outputs))
+        return e_x / np.sum(e_x)
+
+    def predict(self, image_bgr: "Any", bbox: tuple[int, int, int, int]) -> dict[str, Any]:
+        """Prediksi apakah wajah pada bbox adalah manusia asli atau serangan spoof."""
+        import numpy as np
+
+        x1, y1, x2, y2 = bbox
+        box_w = max(0, x2 - x1)
+        box_h = max(0, y2 - y1)
+
+        if min(box_w, box_h) < 80:
+            return {
+                "is_live": False,
+                "label": "Wajah Terlalu Jauh / Kecil",
+                "score": 0.10,
+                "type": "too_small",
+                "probs": [0.10, 0.10, 0.80],
+            }
+
+        probs_list = []
+        if self.session_v2 is not None and self.input_name_v2:
+            crop2 = self.crop_face(image_bgr, bbox, scale=self.scale)
+            probs_list.append(self._infer_session(self.session_v2, self.input_name_v2, crop2))
+
+        if self.session_v1se is not None and self.input_name_v1se:
+            crop4 = self.crop_face(image_bgr, bbox, scale=4.0)
+            probs_list.append(self._infer_session(self.session_v1se, self.input_name_v1se, crop4))
+
+        if not probs_list:
+            return {
+                "is_live": True,
+                "label": "Tidak Dinilai",
+                "score": 1.0,
+                "type": "unassessed",
+                "probs": [0.0, 1.0, 0.0],
+            }
+
+        probs = np.mean(probs_list, axis=0)
+        p_print, p_live, p_replay = float(probs[0]), float(probs[1]), float(probs[2])
+
+        pred_idx = int(np.argmax(probs))
+        is_live = bool(pred_idx == 1 and p_live >= self.threshold)
+        label = self.LABELS[pred_idx]
+        spoof_type = "real" if is_live else ("print" if pred_idx == 0 else "replay")
+
+        return {
+            "is_live": is_live,
+            "label": label,
+            "score": round(p_live, 4),
+            "type": spoof_type,
+            "probs": [round(p_print, 4), round(p_live, 4), round(p_replay, 4)],
+        }
+
+
+# =====================================================================
 # MESIN WAJAH
 # =====================================================================
 
@@ -496,6 +698,7 @@ class FaceEngine:
 
     def __init__(self) -> None:
         self.analyzer: Any | None = None
+        self.antispoof: AntiSpoofDetector | None = None
         self.error: str | None = None
         self.loaded_at: float | None = None
         self.load_seconds: float | None = None
@@ -541,6 +744,18 @@ class FaceEngine:
             self.load_seconds = time.perf_counter() - mulai
 
             logger.info("model siap dalam %.2f detik", self.load_seconds)
+
+            if ENABLE_ANTISPOOF:
+                try:
+                    self.antispoof = AntiSpoofDetector(
+                        model_dir=ANTISPOOF_MODEL_DIR,
+                        threshold=ANTISPOOF_THRESHOLD,
+                        scale=ANTISPOOF_SCALE,
+                        intra_threads=ORT_INTRA_THREADS,
+                        inter_threads=ORT_INTER_THREADS,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("anti-spoofing gagal dimuat: %s", exc)
 
             if WARMUP:
                 self.warmup()
@@ -626,14 +841,75 @@ class FaceEngine:
         if MAX_FACES > 0:
             urutan = urutan[:MAX_FACES]
 
-        hasil: list[dict[str, Any]] = []
-
+        # Tahap 1: Evaluasi batas ukuran & deteksi Anti-Spoofing MiniFASNet
+        raw_faces: list[dict[str, Any]] = []
         for index in urutan:
             x1, y1, x2, y2 = (int(round(float(nilai))) for nilai in bboxes[index, 0:4])
             det_score = float(bboxes[index, 4])
             sisi = max(0, min(x2 - x1, y2 - y1))
             terlalu_kecil = min_face_size > 0 and sisi < min_face_size
 
+            antispoof_res: dict[str, Any] | None = None
+            if self.antispoof is not None and not terlalu_kecil:
+                try:
+                    antispoof_res = self.antispoof.predict(image, (x1, y1, x2, y2))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("anti-spoofing predict gagal: %s", exc)
+
+            raw_faces.append(
+                {
+                    "index": index,
+                    "bbox": (x1, y1, x2, y2),
+                    "det_score": det_score,
+                    "face_size": sisi,
+                    "terlalu_kecil": terlalu_kecil,
+                    "antispoof": antispoof_res,
+                }
+            )
+
+        # Tahap 2: Konsistensi Layar / Foto Bersama (Group Replay Consistency)
+        # Jika dalam 1 frame terdeteksi minimal 1 wajah yang terbukti Layar HP/Monitor
+        # atau Foto Kertas (terdeteksi spoof), seluruh wajah di frame ini adalah bagian foto grup di layar/kertas!
+        has_screen_replay = any(
+            (
+                rf["antispoof"] is not None
+                and not rf["antispoof"]["is_live"]
+                and (
+                    "Layar" in rf["antispoof"]["label"]
+                    or "Replay" in rf["antispoof"]["label"]
+                    or "Kertas" in rf["antispoof"]["label"]
+                    or "Print" in rf["antispoof"]["label"]
+                    or rf["antispoof"]["probs"][2] >= 0.45
+                    or rf["antispoof"]["probs"][0] >= 0.45
+                )
+            )
+            for rf in raw_faces
+        )
+
+        hasil: list[dict[str, Any]] = []
+
+        for rf in raw_faces:
+            index = rf["index"]
+            x1, y1, x2, y2 = rf["bbox"]
+            det_score = rf["det_score"]
+            sisi = rf["face_size"]
+            terlalu_kecil = rf["terlalu_kecil"]
+            antispoof_res = rf["antispoof"]
+
+            if has_screen_replay and antispoof_res is not None and antispoof_res["is_live"]:
+                antispoof_res = {
+                    "is_live": False,
+                    "label": "Layar HP/Monitor (Grup Foto)",
+                    "score": min(antispoof_res["score"], 0.20),
+                    "type": "replay",
+                    "probs": [
+                        antispoof_res["probs"][0],
+                        min(antispoof_res["probs"][1], 0.20),
+                        max(antispoof_res["probs"][2], 0.80),
+                    ],
+                }
+
+            is_live = antispoof_res is None or antispoof_res["is_live"]
             encoding: list[float] | None = None
             kesalahan: str | None = None
 
@@ -641,6 +917,10 @@ class FaceEngine:
                 # Tidak dihitung angkanya: satu wajah kecil bisa memakan waktu
                 # sebesar wajah besar, sedangkan angkanya tidak layak dipercaya.
                 kesalahan = "face_too_small"
+            elif not is_live:
+                # Wajah terdeteksi sebagai foto palsu / layar HP / foto cetak.
+                # Lewati model pengenalan ArcFace untuk menghemat CPU dan tandai spoof.
+                kesalahan = "spoof_detected"
             elif need_embeddings:
                 try:
                     face = Face(
@@ -684,6 +964,7 @@ class FaceEngine:
                     "det_score": round(det_score, 4),
                     "encoding": encoding,
                     "error": kesalahan,
+                    "antispoof": antispoof_res,
                     "quality": (
                         face_quality(
                             image,
@@ -835,6 +1116,11 @@ def build_app() -> "Any":
                 "onnxruntime_inter": ORT_INTER_THREADS,
                 "opencv": OPENCV_THREADS,
             },
+            "antispoof": {
+                "enabled": ENABLE_ANTISPOOF,
+                "threshold": ANTISPOOF_THRESHOLD,
+                "ready": ENGINE.antispoof is not None,
+            },
         }
 
         return JSONResponse(badan, status_code=200 if siap else 503)
@@ -903,6 +1189,17 @@ def build_app() -> "Any":
 
         utama = wajah[0]
 
+        if utama.get("antispoof") and not utama["antispoof"]["is_live"]:
+            spoof_lbl = utama["antispoof"].get("label", "Foto Palsu")
+            return JSONResponse(
+                _balasan_refusal(
+                    "spoof_detected",
+                    f"Foto tidak sah: Terdeteksi {spoof_lbl}. Wajib menggunakan wajah asli secara langsung.",
+                    face_count=len(wajah),
+                    face_size=utama["face_size"],
+                )
+            )
+
         if utama["encoding"] is None:
             return JSONResponse(
                 _balasan_refusal(
@@ -951,6 +1248,7 @@ def build_app() -> "Any":
             "model": _iris_model(),
             "message": "Wajah terbaca.",
             "quality": utama.get("quality"),
+            "antispoof": utama.get("antispoof"),
         }
 
         return JSONResponse(_terapkan_opsi(balasan, frame, minta_bukti))
@@ -1028,6 +1326,7 @@ def build_app() -> "Any":
                     "face_size": satu["face_size"],
                     "encoding": satu["encoding"],
                     "error": satu["error"],
+                    "antispoof": satu.get("antispoof"),
                     "quality": satu.get("quality"),
                 }
             )
@@ -1071,6 +1370,7 @@ def print_check() -> int:
     print(f"  ambang detektor       : {DET_THRESHOLD}")
     print(f"  batas wajah per foto  : {MAX_FACES}")
     print(f"  batas wajah terkecil  : {EMBED_MIN_FACE_SIZE} px")
+    print(f"  anti-spoof            : {'aktif' if ENABLE_ANTISPOOF else 'nonaktif'} (ambang {ANTISPOOF_THRESHOLD:.2f}, model {ANTISPOOF_MODEL_DIR})")
     print(f"  thread                : intra {ORT_INTRA_THREADS}, inter {ORT_INTER_THREADS}, opencv {OPENCV_THREADS}")
     print(f"  foto bukti            : sisi {PROOF_MAX_SIDE}, mutu {PROOF_QUALITY}, batas {PROOF_MAX_KB} KB")
     print("  mutu pendaftaran      : hanya bila quality=1 diminta")
@@ -1105,6 +1405,10 @@ def print_preload() -> int:
         print(f"model GAGAL dimuat: {ENGINE.error}")
 
         return 1
+
+    if ENGINE.antispoof is not None:
+        ENGINE.antispoof._ensure_models_exist()
+        print(f"model anti-spoof MiniFASNet siap di {ANTISPOOF_MODEL_DIR}")
 
     print(f"model {MODEL_LABEL} siap, dimuat dalam {ENGINE.load_seconds:.2f} detik")
     print(f"folder model: {MODEL_ROOT}")
