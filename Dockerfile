@@ -86,7 +86,9 @@ RUN python tambal_insightface.py
 # layanan dipakai.
 COPY app.py ./
 
-ENV FACE_MODEL=buffalo_sc \
+ARG FACE_MODEL=buffalo_sc
+
+ENV FACE_MODEL=${FACE_MODEL} \
     FACE_MODEL_ROOT=/model \
     FACE_DIMENSIONS=512 \
     FACE_WARMUP=0

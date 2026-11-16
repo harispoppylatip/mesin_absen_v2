@@ -18,6 +18,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        FACE_MODEL: ${FACE_MODEL:-buffalo_sc}
     image: layanan-wajah-insightface:1.0.0
     container_name: wajah-insightface
     restart: unless-stopped
