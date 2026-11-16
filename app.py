@@ -50,11 +50,13 @@ Menjalankan
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
 import os
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -791,6 +793,7 @@ class FaceEngine:
         need_embeddings: bool = True,
         min_face_size: int = EMBED_MIN_FACE_SIZE,
         with_quality: bool = False,
+        with_antispoof: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Deteksi semua wajah, lalu hitung angkanya HANYA bila akan dipakai.
 
@@ -842,6 +845,7 @@ class FaceEngine:
             urutan = urutan[:MAX_FACES]
 
         # Tahap 1: Evaluasi batas ukuran & deteksi Anti-Spoofing MiniFASNet
+        jalankan_antispoof = self.antispoof is not None and (with_antispoof is not False)
         raw_faces: list[dict[str, Any]] = []
         for index in urutan:
             x1, y1, x2, y2 = (int(round(float(nilai))) for nilai in bboxes[index, 0:4])
@@ -850,7 +854,7 @@ class FaceEngine:
             terlalu_kecil = min_face_size > 0 and sisi < min_face_size
 
             antispoof_res: dict[str, Any] | None = None
-            if self.antispoof is not None and not terlalu_kecil:
+            if jalankan_antispoof and not terlalu_kecil:
                 try:
                     antispoof_res = self.antispoof.predict(image, (x1, y1, x2, y2))
                 except Exception as exc:  # noqa: BLE001
@@ -1039,6 +1043,7 @@ def apply_runtime_limits(
 
 
 ENGINE = FaceEngine()
+INFERENCE_LOCK = threading.Lock()
 
 
 # =====================================================================
@@ -1131,6 +1136,7 @@ def build_app() -> "Any":
         with_photo: str | None = Query(None),
         require_single: str | None = Query(None),
         quality: str | None = Query(None),
+        antispoof: str | None = Query(None),
     ) -> JSONResponse:
         """Hitung angka wajah untuk SATU orang.
 
@@ -1148,6 +1154,7 @@ def build_app() -> "Any":
         minta_bukti = _benar(with_photo)
         satu_saja = _benar(require_single)
         minta_mutu = _benar(quality)
+        minta_antispoof = True if antispoof is None else _benar(antispoof)
 
         if not ENGINE.ready:
             return JSONResponse(
@@ -1163,16 +1170,26 @@ def build_app() -> "Any":
             )
 
         data = await image.read()
-        frame = decode_image(data)
+
+        def _proses_encode() -> tuple[Any, list[dict[str, Any]], float]:
+            frm = decode_image(data)
+            if frm is None:
+                return None, [], 0.0
+            t0 = time.perf_counter()
+            with INFERENCE_LOCK:
+                hasil_wajah = ENGINE.analyze(
+                    frm,
+                    need_embeddings=True,
+                    min_face_size=0,
+                    with_quality=minta_mutu,
+                    with_antispoof=minta_antispoof,
+                )
+            return frm, hasil_wajah, time.perf_counter() - t0
+
+        frame, wajah, detik = await asyncio.to_thread(_proses_encode)
 
         if frame is None:
             return JSONResponse(_balasan_refusal("no_face", "Foto tidak terbaca. Ambil ulang fotonya."), status_code=400)
-
-        mulai = time.perf_counter()
-        # Pada jalur satu orang, angka wajah selalu dihitung: hanya ada satu
-        # wajah, jadi menghemat di sini tidak ada gunanya.
-        wajah = ENGINE.analyze(frame, need_embeddings=True, min_face_size=0, with_quality=minta_mutu)
-        detik = time.perf_counter() - mulai
 
         if not wajah:
             return JSONResponse(_balasan_refusal("no_face", "Wajah tidak terlihat."))
@@ -1258,6 +1275,7 @@ def build_app() -> "Any":
         image: UploadFile = File(..., description="Berkas foto, field bernama image"),
         with_photo: str | None = Query(None),
         quality: str | None = Query(None),
+        antispoof: str | None = Query(None),
     ) -> JSONResponse:
         """Hitung angka wajah untuk SELURUH wajah di satu bingkai.
 
@@ -1277,6 +1295,7 @@ def build_app() -> "Any":
         """
         minta_bukti = _benar(with_photo)
         minta_mutu = _benar(quality)
+        minta_antispoof = True if antispoof is None else _benar(antispoof)
 
         kosong: dict[str, Any] = {
             "status": "no_face",
@@ -1292,21 +1311,28 @@ def build_app() -> "Any":
             return JSONResponse({**kosong, "status": "error", "message": "Model wajah belum siap di layanan."}, status_code=503)
 
         data = await image.read()
-        frame = decode_image(data)
+
+        def _proses_detect() -> tuple[Any, list[dict[str, Any]], float]:
+            frm = decode_image(data)
+            if frm is None:
+                return None, [], 0.0
+            t0 = time.perf_counter()
+            with INFERENCE_LOCK:
+                hasil_wajah = ENGINE.analyze(
+                    frm,
+                    need_embeddings=True,
+                    min_face_size=EMBED_MIN_FACE_SIZE,
+                    with_quality=minta_mutu,
+                    with_antispoof=minta_antispoof,
+                )
+            return frm, hasil_wajah, time.perf_counter() - t0
+
+        frame, wajah, detik = await asyncio.to_thread(_proses_detect)
 
         if frame is None:
             return JSONResponse({**kosong, "status": "error", "message": "Foto tidak terbaca. Ambil ulang fotonya."}, status_code=400)
 
         tinggi, lebar = frame.shape[:2]
-
-        mulai = time.perf_counter()
-        wajah = ENGINE.analyze(
-            frame,
-            need_embeddings=True,
-            min_face_size=EMBED_MIN_FACE_SIZE,
-            with_quality=minta_mutu,
-        )
-        detik = time.perf_counter() - mulai
 
         if not wajah:
             return JSONResponse({**kosong, "width": lebar, "height": tinggi})
