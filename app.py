@@ -806,6 +806,7 @@ class FaceEngine:
         min_face_size: int = EMBED_MIN_FACE_SIZE,
         with_quality: bool = False,
         with_antispoof: bool | None = None,
+        skip_small_antispoof: bool = False,
     ) -> list[dict[str, Any]]:
         """Deteksi semua wajah, lalu hitung angkanya HANYA bila akan dipakai.
 
@@ -866,7 +867,7 @@ class FaceEngine:
             terlalu_kecil = min_face_size > 0 and sisi < min_face_size
 
             antispoof_res: dict[str, Any] | None = None
-            if jalankan_antispoof and not terlalu_kecil:
+            if jalankan_antispoof and not terlalu_kecil and not (skip_small_antispoof and sisi < 80):
                 try:
                     antispoof_res = self.antispoof.predict(image, (x1, y1, x2, y2))
                 except Exception as exc:  # noqa: BLE001
@@ -1289,6 +1290,7 @@ def build_app() -> "Any":
         quality: str | None = Query(None),
         antispoof: str | None = Query(None),
         need_embeddings: str | None = Query(None),
+        skip_small_antispoof: str | None = Query(None),
     ) -> JSONResponse:
         """Hitung angka wajah untuk SELURUH wajah di satu bingkai.
 
@@ -1310,6 +1312,7 @@ def build_app() -> "Any":
         minta_mutu = _benar(quality)
         minta_antispoof = True if antispoof is None else _benar(antispoof)
         minta_angka = True if need_embeddings is None else _benar(need_embeddings)
+        lewati_antispoof_kecil = _benar(skip_small_antispoof)
 
         kosong: dict[str, Any] = {
             "status": "no_face",
@@ -1338,6 +1341,7 @@ def build_app() -> "Any":
                     min_face_size=EMBED_MIN_FACE_SIZE,
                     with_quality=minta_mutu,
                     with_antispoof=minta_antispoof,
+                    skip_small_antispoof=lewati_antispoof_kecil,
                 )
             return frm, hasil_wajah, time.perf_counter() - t0
 
