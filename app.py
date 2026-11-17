@@ -441,7 +441,9 @@ def face_quality(frame: "Any", box: tuple[int, int, int, int], kps: "Any | None"
     tengah_mulut = (kiri_mulut + kanan_mulut) / 2.0
     jarak_tegak = float(tengah_mulut[1] - tengah_mata[1])
 
-    hasil["yaw"] = round(abs(float(hidung[0] - tengah_mata[0])) / jarak_mata, 4)
+    yaw_mentah = float(hidung[0] - tengah_mata[0]) / jarak_mata
+    hasil["yaw"] = round(abs(yaw_mentah), 4)
+    hasil["yaw_signed"] = round(yaw_mentah, 4)
     hasil["roll"] = round(abs(float(kiri_mata[1] - kanan_mata[1])) / jarak_mata, 4)
 
     if abs(jarak_tegak) > 1e-6:
@@ -1276,6 +1278,7 @@ def build_app() -> "Any":
         with_photo: str | None = Query(None),
         quality: str | None = Query(None),
         antispoof: str | None = Query(None),
+        need_embeddings: str | None = Query(None),
     ) -> JSONResponse:
         """Hitung angka wajah untuk SELURUH wajah di satu bingkai.
 
@@ -1296,6 +1299,7 @@ def build_app() -> "Any":
         minta_bukti = _benar(with_photo)
         minta_mutu = _benar(quality)
         minta_antispoof = True if antispoof is None else _benar(antispoof)
+        minta_angka = True if need_embeddings is None else _benar(need_embeddings)
 
         kosong: dict[str, Any] = {
             "status": "no_face",
@@ -1320,7 +1324,7 @@ def build_app() -> "Any":
             with INFERENCE_LOCK:
                 hasil_wajah = ENGINE.analyze(
                     frm,
-                    need_embeddings=True,
+                    need_embeddings=minta_angka,
                     min_face_size=EMBED_MIN_FACE_SIZE,
                     with_quality=minta_mutu,
                     with_antispoof=minta_antispoof,
