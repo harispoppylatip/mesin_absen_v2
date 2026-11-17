@@ -180,19 +180,22 @@ PROOF_QUALITIES = tuple(max(30, PROOF_QUALITY - langkah * 8) for langkah in rang
 # jumlah foto bertambah banyak.
 #
 # Kecerahan rata-rata bagian tengah wajah, skala 0 sampai 255.
-MIN_FACE_BRIGHTNESS = _angka(os.getenv("FACE_MIN_BRIGHTNESS"), 50)
-MAX_FACE_BRIGHTNESS = _angka(os.getenv("FACE_MAX_BRIGHTNESS"), 238)
+# Dipakai sebagai jaring pengaman lapis kedua di antrean (lebih longgar dari
+# pemeriksaan kamera langsung di tahap 1 supaya foto yang sudah lolos di kamera
+# tidak pernah ditolak di antrean).
+MIN_FACE_BRIGHTNESS = _angka(os.getenv("FACE_MIN_BRIGHTNESS"), 35)
+MAX_FACE_BRIGHTNESS = _angka(os.getenv("FACE_MAX_BRIGHTNESS"), 242)
 # Ragam Laplacian. Semakin kecil, semakin buram gambarnya. Potongan wajah
 # diseragamkan ke ukuran ini lebih dulu supaya satu ambang berlaku untuk semua
 # besar wajah.
-MIN_FACE_SHARPNESS = _angka(os.getenv("FACE_MIN_SHARPNESS"), 25)
+MIN_FACE_SHARPNESS = _angka(os.getenv("FACE_MIN_SHARPNESS"), 14)
 QUALITY_SHARPNESS_SIDE = _angka(os.getenv("FACE_QUALITY_SIDE"), 128)
 # Arah hadap, semuanya dibagi jarak antar mata supaya tidak bergantung besar
 # wajah di dalam bingkai. `pitch` adalah posisi hidung di antara garis mata dan
 # garis mulut: makin kecil, makin mendongak; makin besar, makin menunduk.
-MAX_FACE_YAW = _pecahan(os.getenv("FACE_MAX_YAW"), 0.60)
-MAX_FACE_ROLL = _pecahan(os.getenv("FACE_MAX_ROLL"), 0.50)
-MIN_FACE_PITCH = _pecahan(os.getenv("FACE_MIN_PITCH"), 0.28)
+MAX_FACE_YAW = _pecahan(os.getenv("FACE_MAX_YAW"), 0.75)
+MAX_FACE_ROLL = _pecahan(os.getenv("FACE_MAX_ROLL"), 0.55)
+MIN_FACE_PITCH = _pecahan(os.getenv("FACE_MIN_PITCH"), 0.18)
 MAX_FACE_PITCH = _pecahan(os.getenv("FACE_MAX_PITCH"), 0.92)
 
 # --- Anti-Spoofing (Liveness Detection - MiniFASNet ONNX) -----------
@@ -679,9 +682,16 @@ class AntiSpoofDetector:
         p_print, p_live, p_replay = float(probs[0]), float(probs[1]), float(probs[2])
 
         pred_idx = int(np.argmax(probs))
-        is_live = bool(pred_idx == 1 and p_live >= self.threshold)
-        label = self.LABELS[pred_idx]
-        spoof_type = "real" if is_live else ("print" if pred_idx == 0 else "replay")
+        # Jika kelas tertinggi adalah Asli (pred_idx == 1) dan skor live memadai
+        # (termasuk saat wajah menengok serong/mendongak/menunduk), nyatakan asli.
+        is_live = bool((pred_idx == 1 and p_live >= min(self.threshold, 0.38)) or p_live >= self.threshold)
+        if is_live:
+            label = self.LABELS[1]
+            spoof_type = "real"
+        else:
+            spoof_idx = 0 if p_print >= p_replay else 2
+            label = self.LABELS[spoof_idx]
+            spoof_type = "print" if spoof_idx == 0 else "replay"
 
         return {
             "is_live": is_live,
